@@ -1,5 +1,13 @@
 {
-  "editor.tokenColorCustomizations": {
-    "comments": "#00FF00"
-  }
+    "editor.tokenColorCustomizations": {
+        "textMateRules": [
+            {
+                "scope": "comment",
+                "settings": {
+                    "foreground": "#00FF00",
+                    "fontStyle": "italic"
+                }
+            }
+        ]
+    }
 }
