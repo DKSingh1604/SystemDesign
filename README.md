@@ -2109,6 +2109,7 @@ graph TD
     
     style Mono fill:#f9d0c4,stroke:#333,stroke-width:2px
     style Micro fill:#d4f1f4,stroke:#333,stroke-width:2px
+```
 Gradually shift traffic using a routing facade/API Gateway until the monolith service handles 0% and can be deleted.
 
 ## 7. Database Patterns
