@@ -1937,6 +1937,314 @@ STAGE 7: 10,000,000+ users
 ╚══════════════════════════════════════════════════════════╝
 ```
 
+# 📘 Lecture 03: CAP Theorem, BoE Calculations & Microservices
+
+> **Part of:** System Design (HLD) Interview Preparation
+> **Focus:** CAP Theorem, Back-of-the-Envelope (BoE) Calculations, Monolith vs Microservices, SAGA, and CQRS.
+> **Target:** Tier-1 MNC System Design Interviews
+
+---
+
+## 📑 Table of Contents
+
+1. [CAP Theorem & PACELC](#1-cap-theorem--pacelc)
+2. [Partition Tolerance in Action](#2-partition-tolerance-in-action)
+3. [Availability Numbers (The 9s)](#3-availability-numbers-the-9s)
+4. [Back-of-the-Envelope (BoE) Calculations](#4-back-of-the-envelope-boe-calculations)
+5. [Monolith vs Microservices](#5-monolith-vs-microservices)
+6. [Microservice Decomposition & Strangler Fig](#6-microservice-decomposition--strangler-fig)
+7. [Database Patterns](#7-database-patterns)
+8. [SAGA Pattern (Distributed Transactions)](#8-saga-pattern-distributed-transactions)
+9. [CQRS (Command Query Responsibility Segregation)](#9-cqrs-command-query-responsibility-segregation)
+10. [Interview Questions & Follow-Ups](#10-interview-questions--follow-ups)
+11. [Rapid Revision Cheat Sheet](#11-rapid-revision-cheat-sheet)
+
+---
+
+## 1. CAP Theorem & PACELC
+
+### 🎯 Definition
+
+The **CAP Theorem** states that in a distributed system, during a **Network Partition (P)**, you must choose between **Consistency (C)** and **Availability (A)**. You cannot have both.
+
+- **Consistency (C):** Every read receives the most recent write or an error. (All nodes see the same data).
+- **Availability (A):** Every request receives a non-error response (but it might be stale data).
+- **Partition Tolerance (P):** The system continues to operate despite network failures/splits between nodes.
+
+> ⚠️ **Note:** In distributed systems, partitions **will** happen. Therefore, you are always choosing between **CP** and **AP**. There is no true "CA" distributed system.
+
+### 🧠 PACELC Theorem (The Modern Extension)
+
+CAP only explains what happens *during a partition*. PACELC explains normal operation too.
+
+> *"If there is a **P**artition, choose between **A**vailability and **C**onsistency; **E**lse (running normally), choose between **L**atency and **C**onsistency."*
+
+| Database | Partition | Normal | Classification |
+|----------|-----------|--------|----------------|
+| **DynamoDB / Cassandra** | PA | EL | Speed and availability over all |
+| **MongoDB** | PA | EC | Available, but consistent normally |
+| **HBase / MySQL / Spanner** | PC | EC | Consistency above all |
+
+### 🌈 Consistency Spectrum
+
+Consistency is not binary. It's a spectrum:
+1. **Linearizable (Strongest):** Instantaneous global state (Spanner, ZooKeeper).
+2. **Sequential:** Operations appear in *some* consistent order.
+3. **Causal:** Causally related operations are seen in order.
+4. **Eventual (Weakest/Fastest):** Given enough time, all nodes converge (DynamoDB, Cassandra).
+
+---
+
+## 2. Partition Tolerance in Action
+
+If a node (DB3) loses connection to DB1 & DB2, the system must decide:
+
+### Option A: CP System (Consistency + Partition Tolerance)
+- **Action:** Revoke write operations to prevent data divergence.
+- **Result:** Consistency is maintained, but **Availability is compromised** (users get errors).
+- **Use cases:** Banking, Stock trading, Inventory systems (can't oversell).
+
+### Option B: AP System (Availability + Partition Tolerance)
+- **Action:** Allow users to write to DB1/DB2. DB3 serves stale data.
+- **Result:** System stays up (**Availability achieved**), but **Consistency is compromised**.
+- **Use cases:** Social media feeds, Shopping carts, CDNs, Messaging.
+
+> ⭐ **In standard commercial/web apps, Availability is usually preferred over Consistency.**
+
+---
+
+## 3. Availability Numbers (The 9s)
+
+Availability is measured in "nines" — the percentage of time a system is fully operational.
+
+| Availability | Nines | Downtime per Year | Downtime per Month | Downtime per Day |
+|--------------|-------|-------------------|--------------------|------------------|
+| **90%** | 1 | 36.5 days | 72 hours | 2.4 hr |
+| **99%** | 2 | 3.65 days | 7.2 hours | 14.4 min |
+| **99.9%** | 3 | **8.77 hours** | **43.2 min** | 1.44 min |
+| **99.95%** | 3.5 | 4.38 hours | 21.6 min | 43.2 sec |
+| **99.99%** | 4 | 52.6 min | 4.32 min | 8.64 sec |
+| **99.999%** | 5 | 5.26 min | 25.9 sec | 864 ms |
+
+### 📖 SLA, SLO, SLI
+- **SLA (Service Level Agreement):** The external legal *promise* made to customers (e.g., 99.9% or you get a refund).
+- **SLO (Service Level Objective):** The internal *goal* (e.g., 99.95%).
+- **SLI (Service Level Indicator):** The actual *measurement* right now (e.g., 99.97%).
+
+---
+
+## 4. Back-of-the-Envelope (BoE) Calculations
+
+Calculations done before HLD to estimate the scale of QPS, Storage, Bandwidth, and Servers.
+
+### 🔢 Essential Reference Numbers
+
+**Powers of 2:**
+- $2^{10}$ ≈ 1,000 (1 KB)
+- $2^{20}$ ≈ 1 Million (1 MB)
+- $2^{30}$ ≈ 1 Billion (1 GB)
+- $2^{40}$ ≈ 1 Trillion (1 TB)
+- $2^{50}$ ≈ 1 Quadrillion (1 PB)
+- $2^{60}$ ≈ 1 Quintillion (1 EB)
+
+**Time:**
+- Seconds in a day ≈ 86,400 ($\sim 10^5$)
+
+### 📝 BoE Example: Instagram
+
+**1. Assumptions:**
+- MAU: 2 Billion
+- DAU: 1.2 Billion (60% of MAU)
+- User checks feed 30 times/day
+- User uploads 1 post/day
+- 80% photos (1 MB avg), 20% videos (50 MB avg)
+
+**2. QPS Estimation:**
+- **Daily Feed Requests:** 1.2B * 30 = 36 Billion/day
+- **Avg Read QPS:** $36B / 86,400 \approx 420,000$ QPS
+- **Peak Read QPS:** $420K \times 5 = 2.1$ Million QPS
+- **Avg Write QPS:** $1.2B / 86,400 \approx 14,000$ QPS
+- **Peak Write QPS:** $14K \times 5 = 70,000$ QPS
+
+**3. Storage Estimation (for 5 years):**
+- **Photos/day:** 1.2B * 0.8 * 1 MB ≈ 1 PB/day
+- **Videos/day:** 1.2B * 0.2 * 50 MB ≈ 12 PB/day
+- **Total daily:** ~13 PB/day
+- **5 Years Raw:** 13 PB * 365 * 5 ≈ 24 Exabytes (EB)
+- **Real Storage (w/ Replication):** 24 EB * 3 (replication factor) ≈ 72 EB
+
+---
+
+## 5. Monolith vs Microservices
+
+### 🧱 Monolith
+A single codebase deployed as a single artifact.
+
+- ✅ **Pros:** Fast method calls, easy debugging, simple transactions, easy to deploy initially.
+- ❌ **Cons:** Scaling is rigid (must scale whole app), heavy codebase, single point of failure (one bug crashes app), tech lock-in.
+
+### 🧩 Microservices
+Application divided into small, independent services communicating over a network.
+
+- ✅ **Pros:** Independent scaling, CI/CD agility, tech freedom (polyglot), fault isolation.
+- ❌ **Cons:** Network latency, complex distributed transactions, hard debugging, operational/DevOps overhead.
+
+> 💡 **Industry Wisdom (Modular Monolith):** Start with a Monolith (or Modular Monolith) to find bounded contexts. Extract to Microservices only when scaling/team size demands it.
+
+---
+
+## 6. Microservice Decomposition & Strangler Fig
+
+### ✂️ How to Decompose
+1. **By Business Logic (BL):** e.g., Orders, Payments, Users. (Can create ambiguity for shared concepts).
+2. **By Subdomain (DDD):** e.g., `zomato/orders`, `zomato/discovery`. Defines clear "Bounded Contexts".
+
+### 🌿 Strangler Fig Pattern (Eventual Conversion)
+How to migrate from Monolith to Microservices with zero downtime:
+
+```mermaid
+graph TD
+    Client -->|Phase 1: 90%| Mono[Monolith]
+    Client -->|Phase 2: 10%| Micro[New Microservice]
+    
+    style Mono fill:#f9d0c4,stroke:#333,stroke-width:2px
+    style Micro fill:#d4f1f4,stroke:#333,stroke-width:2px
+Gradually shift traffic using a routing facade/API Gateway until the monolith service handles 0% and can be deleted.
+
+## 7. Database Patterns
+
+### Pattern A: Shared DB
+All microservices talk to a single database.
+
+- ✅ **Pros:** Easy transactions (ACID), simple JOINs.
+- ❌ **Cons:** Single point of failure, no independent scaling, strong coupling.
+
+### Pattern B: Database per Service
+Every microservice has its own unique DB (e.g., Users → PostgreSQL, Orders → MongoDB).
+
+- ✅ **Pros:** Highly scalable, polyglot persistence, isolated failures.
+- ❌ **Cons:** Complex distributed transactions, cross-service JOINs are impossible natively.
+
+---
+
+## 8. SAGA Pattern (Distributed Transactions)
+
+**Problem:** In "DB per service", how do you rollback a transaction that spans 3 services if the 3rd one fails? There is no global COMMIT or ROLLBACK.
+
+**Solution: SAGA Pattern (Event-Driven)**
+Instead of one massive transaction, break it into local transactions. If a step fails, trigger Compensating Transactions (undo operations) in reverse.
+
+### Choreography-Based SAGA (Event-Driven)
+
+```mermaid
+graph LR
+    S1[Order Svc] -- Event --> S2[Payment Svc]
+    S2 -- Event --> S3[Inventory Svc]
+    
+    S3 -. "Fails (Rollback Event)" .-> S2
+    S2 -. "Rollback Event" .-> S1
+    
+    style S3 fill:#ffcccc
+```
+
+**Compensating Transaction Examples:**
+- Action: Charge Credit Card → Compensation: Refund Credit Card
+- Action: Reserve Inventory → Compensation: Release Inventory
+
+*(Note: The alternative is Orchestration-Based SAGA, which uses a central coordinator service to manage the flow and rollbacks).*
+
+---
+
+## 9. CQRS (Command Query Responsibility Segregation)
+**Problem:** How do you run complex JOIN queries across multiple microservices that own their own databases?
+
+**Solution: CQRS**
+Separate the Command (Writes) from the Query (Reads).
+
+1. Write operations go to the individual microservice databases.
+2. These databases emit events.
+3. A separate View DB (optimized for reads, highly denormalized) listens to these events and builds pre-joined materialised views.
+
+```mermaid
+graph TD
+    DB1[(Order DB)] -. Events .-> ViewDB[(View DB - ElasticSearch)]
+    DB2[(Payment DB)] -. Events .-> ViewDB
+    DB3[(User DB)] -. Events .-> ViewDB
+    
+    Client -- Read Query --> ViewDB
+    Client -- Write Query --> DB1
+```
+
+- ✅ **Pros:** Blazing fast reads, independent scaling of reads vs writes.
+- ❌ **Cons:** Eventual consistency (View DB lags slightly), data duplication, infrastructure complexity.
+
+**Event Sourcing:** Often paired with CQRS. Instead of storing current state, you store a log of every event/change. Current state is derived by replaying events.
+
+---
+
+## 10. Interview Questions & Follow-Ups
+### Q1: "Design a system that is both strongly consistent AND highly available."
+> **Answer:** "According to the CAP theorem, true 'CA' is impossible during a network partition. I would use PACELC to define this: we either choose a CP system (like Spanner using TrueTime for high availability but prioritizing consistency) or an AP system (like DynamoDB) depending on the business need."
+
+### Q2: "Estimate QPS for a WhatsApp-like system."
+> **Answer:** Walk through the BoE template. 2B users → DAU → messages/user → Daily total → Divide by 86,400 for Avg QPS → Multiply by 2-5x for Peak QPS. Emphasize that Read QPS will be much higher than Write QPS.
+
+### Q3: "You're migrating a monolith to microservices. Which service do you extract first?"
+> **Answer:** "Using the Strangler Fig pattern, I'd extract a service that is highly decoupled and provides high value—like a Notifications service or Search. I wouldn't start with the core transaction engine."
+
+### Q4: "How do you handle a failed SAGA mid-way?"
+> **Answer:** "Through Compensating Transactions. If step 3 fails, it emits a failure event. Step 2 listens, executes an idempotent 'undo' operation (like a refund), and emits a failure event for step 1 to cancel the order."
+
+### Q5: "CQRS adds massive complexity. Why bother?"
+> **Answer:** "It's necessary when read/write patterns differ drastically. For example, in a social feed, there are billions of reads and millions of writes. CQRS allows us to denormalize the read model into something like Elasticsearch or Redis, keeping reads sub-millisecond without locking the write databases."
+
+---
+
+## 11. Rapid Revision Cheat Sheet
+```text
+╔══════════════════════════════════════════════════════════╗
+║           LECTURE 03 — ULTIMATE CHEAT SHEET              ║
+╠══════════════════════════════════════════════════════════╣
+║                                                          ║
+║  CAP THEOREM:                                            ║
+║  • During partition: choose C or A (not both)            ║
+║  • CP: MongoDB, HBase, ZooKeeper (banking, inventory)    ║
+║  • AP: Cassandra, DynamoDB, DNS (social, shopping)       ║
+║  • PACELC: Considers Latency vs Consistency normally     ║
+║                                                          ║
+║  AVAILABILITY NUMBERS:                                   ║
+║  • 99%     = 3.65 days/year down                         ║
+║  • 99.9%   = 8.77 hr/year  (SaaS standard)               ║
+║  • 99.99%  = 52.6 min/year (enterprise)                  ║
+║  • 99.999% = 5.26 min/year (telecom/banking)             ║
+║                                                          ║
+║  BOE CALC TEMPLATE:                                      ║
+║  1. Users (MAU, DAU)                                     ║
+║  2. QPS (avg = daily/86400, peak = 2-5x avg)             ║
+║  3. Storage (× replication 3x, × overhead 1.5x)          ║
+║  4. Cache (20% hot data × size)                          ║
+║  5. Servers (Peak QPS / 1000 per server)                 ║
+║                                                          ║
+║  POWERS OF 2:                                            ║
+║  2^10 ≈ 1K  | 2^20 ≈ 1M  | 2^30 ≈ 1B                     ║
+║  2^40 ≈ 1T  | 2^50 ≈ 1P  | 2^60 ≈ 1E                     ║
+║                                                          ║
+║  MONOLITH vs MICROSERVICES:                              ║
+║  • Monolith first! Extract when pain is real.            ║
+║  • Migration: Strangler Fig Pattern (gradual)            ║
+║                                                          ║
+║  MICROSERVICE DATA PATTERNS:                             ║
+║  • DB per service (no cross-DB access)                   ║
+║  • SAGA: Distributed transactions via events +           ║
+║    compensating actions (undo ops)                       ║
+║  • CQRS: Separate read/write models (View DB)            ║
+║  • Event Sourcing: Store events, derive current state    ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+
+
 ---
 
 ⭐ If you found this helpful, please star the repository!
