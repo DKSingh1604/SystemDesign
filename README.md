@@ -2244,6 +2244,271 @@ graph TD
 ╚══════════════════════════════════════════════════════════╝
 ```
 
+# 📘 Lecture 04: Consistent Hashing & Load Balancers
+
+> **Part of:** System Design (HLD) Interview Preparation
+> **Focus:** Distributing data safely at scale (Consistent Hashing) and routing massive traffic efficiently (Load Balancing).
+> **Target:** Tier-1 MNC System Design Interviews
+
+---
+
+## 📑 Table of Contents
+
+1. [The Problem: Naive Sharding (Modulo)](#1-the-problem-naive-sharding-modulo)
+2. [The Solution: Consistent Hashing](#2-the-solution-consistent-hashing)
+3. [Virtual Nodes (Solving Data Skew)](#3-virtual-nodes-solving-data-skew)
+4. [🚨 The Celebrity Problem (Hot Partitions)](#4--the-celebrity-problem-hot-partitions)
+5. [Load Balancing Fundamentals](#5-load-balancing-fundamentals)
+6. [Load Balancing Algorithms](#6-load-balancing-algorithms)
+7. [L4 vs L7 Load Balancing](#7-l4-vs-l7-load-balancing)
+8. [Health Checks & High Availability](#8-health-checks--high-availability)
+9. [Hardware vs Software LBs](#9-hardware-vs-software-lbs)
+10. [Interview Curveballs & Follow-Ups](#10-interview-curveballs--follow-ups)
+11. [Rapid Revision Cheat Sheet](#11-rapid-revision-cheat-sheet)
+
+---
+
+## 1. The Problem: Naive Sharding (Modulo)
+
+### 🎯 How it works
+The most basic way to route a key to a server is using the modulo operator: `server_index = hash(key) % N` (where `N` is the number of servers).
+
+### ❌ The Nightmare Scenario (The Rehashing Problem)
+Imagine you have **4 servers (N=4)**:
+- Key 0 % 4 = **Server 0**
+- Key 1 % 4 = **Server 1**
+- Key 2 % 4 = **Server 2**
+
+Now, **Server 3 crashes (N drops to 3)**:
+- Key 0 % 3 = **Server 0**
+- Key 1 % 3 = **Server 1**
+- Key 2 % 3 = **Server 2**
+- Key 3 % 3 = **Server 0** *(Changed!)*
+- Key 4 % 3 = **Server 1** *(Changed!)*
+
+**The Fatal Flaw:** When $N$ changes (server added or removed), almost **every single key hashes to a different server**. 
+- If this is a Cache: Massive cache miss (Cache Avalanche) → DB crashes.
+- If this is a DB: Petabytes of data must be migrated over the network instantly.
+
+---
+
+## 2. The Solution: Consistent Hashing
+
+### 🎯 Concept
+Instead of modulo, we map both the **Servers** and the **Keys** onto a circular data structure of a fixed, massive size (e.g., $0$ to $2^{160}-1$ using SHA-1).
+
+1. **Hash the Servers:** `hash(Server_IP)` places the server on the ring.
+2. **Hash the Keys:** `hash(Data_Key)` places the key on the same ring.
+3. **Route:** To find which server owns a key, move **CLOCKWISE** on the ring until you hit the first server.
+
+### 🏗️ The Hash Ring
+
+```mermaid
+graph LR
+    DB1((DB1<br>idx: 10)) -.-> K0(Key 0<br>idx: 25)
+    K0 -->|Clockwise| DB2((DB2<br>idx: 40))
+    DB2 -.-> K1(Key 1<br>idx: 65)
+    K1 -->|Clockwise| DB3((DB3<br>idx: 80))
+    DB3 -.-> K2(Key 2<br>idx: 95)
+    K2 -->|Clockwise / Wraparound| DB1
+    
+    classDef db fill:#d4edda,stroke:#28a745,stroke-width:2px;
+    class DB1,DB2,DB3 db;
+### 🧮 The Math Behind the Magic
+If you have **K** keys and **N** servers:
+
+- **Naive Hashing:** adding/removing a node moves **≈K** keys (nearly 100%).
+- **Consistent Hashing:** adding/removing a node moves only **K/N** keys.
+*(Example: 10,000 keys, 10 servers. If a server dies, only 1,000 keys are re-routed. The other 9,000 stay exactly where they are!)*
+
+### 💻 How is this coded?
+You don't literally step +1 millions of times.
+
+1. Store Server Hashes in a **Sorted Array**.
+2. When a key arrives, do a **Binary Search** ($O(\log N)$) to find the first server hash > the key hash.
+3. If no server is > the key, wrap around to `array[0]`.
+
+---
+
+## 3. Virtual Nodes (Solving Data Skew)
+
+### ⚠️ The Problem: Data Skew
+If you only hash 4 physical servers, they might cluster closely on the ring randomly. One server might handle 60% of the ring, while the others sit idle.
+
+### ✅ The Solution: Virtual Nodes (vNodes)
+Assign multiple "virtual labels" to each physical server (e.g., 100-256 vNodes per server).
+- S1 → S1_01, S1_02, ... S1_100
+- S2 → S2_01, S2_02, ... S2_100
+
+Hash all 400 virtual nodes onto the ring. They interleave perfectly, reducing the standard deviation of load to nearly 0.
+
+> **Industry standard:** Cassandra and DynamoDB use vNodes natively to balance data load.
+
+---
+
+## 4. 🚨 The Celebrity Problem (Hot Partitions)
+
+> **CRITICAL CORRECTION:** Virtual Nodes **DO NOT** solve the Celebrity Problem. They solve Partition Size Skew.
+
+If a key represents "Justin Bieber's Profile" and receives 10 million requests/sec, that key hashes to exactly ONE spot on the ring (one vNode → one physical server). That single server will melt down. This is a **Hot Partition**.
+
+### 🛠️ How to ACTUALLY solve the Celebrity Problem:
+1. **Aggressive Caching (Redis / CDN):** Don't let requests for celebrities hit the DB at all.
+2. **Key Salting / Compound Keys:** Append a random number (1-100) to the key.
+   - `Bieber_01`, `Bieber_02` ... `Bieber_99`.
+   - Now, the data is spread across 100 different servers on the ring. *(Trade-off: Reads require querying 100 servers and aggregating).*
+3. **Dedicated Celebrity Shards:** Use a separate routing table.
+   ```javascript
+   if (is_celebrity) { route_to_massive_cluster(); }
+   else { route_to_hash_ring(); }
+   ```
+---
+
+## 5. Load Balancing Fundamentals
+A **Load Balancer (LB)** is the traffic cop of system design. It sits between clients and servers to distribute incoming traffic.
+
+**Why use an LB?**
+- **Scalability:** Enables Auto-Scaling by distributing traffic to new instances.
+- **Availability:** If a server dies, the LB stops sending traffic to it.
+- **Security:** Hides internal IPs, acts as a firewall, absorbs DDoS attacks.
+- **Responsiveness:** Manages thread pools and backend load.
+
+---
+
+## 6. Load Balancing Algorithms
+
+### A) Static Algorithms (Blind to Server State)
+| Algorithm | How It Works | Pros & Cons |
+|-----------|--------------|-------------|
+| **Round Robin** | Req 1 → S1, Req 2 → S2, Req 3 → S3 | ✅ Good for stateless, identical hardware.<br>❌ Blind to server load or slow requests. |
+| **Weighted Round Robin** | S1(wt:5), S2(wt:1). S1 gets 5x traffic. | ✅ Excellent for mismatched hardware (e.g., 64GB vs 16GB RAM servers). |
+| **IP Hashing** | `hash(Client_IP) % N` → Server | ✅ Creates "Sticky Sessions" (forces user to same server).<br>❌ Bad for corporate proxies (1000 employees behind 1 IP go to 1 server!). |
+
+### B) Dynamic Algorithms (Aware of Server State)
+| Algorithm | How It Works | Best For |
+|-----------|--------------|----------|
+| **Least Connections** | Routes to server with fewest active TCP connections. | Long-lived connections (WebSockets, Chat apps, Gaming). |
+| **Least Response Time** | Routes to server with lowest avg response time + active conns. | APIs where request complexity varies wildly. |
+| **Resource-Based** | Agent on server reports CPU/RAM usage to LB. | Heavy compute tasks (Video rendering, ML inference). |
+
+---
+
+## 7. L4 vs L7 Load Balancing
+
+> **Interview Must-Know:** You will be asked which layer to balance at.
+
+| Feature | L4 Load Balancer (Transport Layer) | L7 Load Balancer (Application Layer) |
+|---------|------------------------------------|--------------------------------------|
+| **What it sees** | IP and Port only (TCP/UDP) | Inside the HTTP payload / Headers / Cookies |
+| **Speed** | Blazing Fast (No decryption) | Slower (Must parse HTTP & JSON) |
+| **TLS/SSL** | Passes encrypted data through (usually) | Terminates SSL (Decrypts, inspects, re-encrypts) |
+| **Smart Routing** | NO. | YES. (Path routing: `/api` → S1, `/video` → S2) |
+| **Tools** | AWS NLB, HAProxy (TCP), F5 Hardware | AWS ALB, Nginx, Envoy, Traefik |
+| **Use Case** | Databases, Gaming, Millions of raw conns/sec | Microservices, Web Apps, API Gateways |
+
+---
+
+## 8. Health Checks & High Availability
+
+### 🏥 Health Probes
+LBs don't just wait for requests to fail. They proactively monitor backend servers:
+- **Active Health Checks (Heartbeats):** LB pings `http://server/health` every 5 seconds. If it fails 3 times, the server is removed from the rotation automatically.
+
+### ⚠️ LB as a Single Point of Failure (SPOF)
+If you only have one Load Balancer and it crashes, your entire system goes down.
+**Solution: Active-Passive VIP Setup**
+
+```text
+        ┌──────────────┐
+        │  Active LB   │ ◄── All traffic
+        │  (Primary)   │
+        └──────┬───────┘
+               │ heartbeat via Keepalived
+        ┌──────┴───────┐
+        │  Passive LB  │ ◄── Takes over Virtual IP (VIP) 
+        │  (Standby)   │     instantly if primary fails
+        └──────────────┘
+```
+---
+
+## 9. Hardware vs Software LBs
+
+**Hardware LBs (F5 Big-IP, Citrix):**
+- Physical rack-mounted devices in on-premise datacenters.
+- Highly specialized chips (ASICs) for SSL decryption.
+- Very expensive, hard to scale out.
+
+**Software LBs (Nginx, HAProxy, Envoy):**
+- Code running on standard Linux servers.
+- Used by 99% of modern tech companies.
+- Cheap, flexible, autoscales instantly in the cloud.
+
+**DNS Load Balancing (Global Level):**
+- `google.com` returns a list of different IPs based on your geography (GeoDNS).
+- Limitation: DNS caching. If a server dies, users' browsers/ISPs might cache the dead IP for hours due to TTL.
+
+---
+
+## 10. Interview Curveballs & Follow-Ups
+
+### Q1: "Why does Cassandra use Consistent Hashing?"
+> **Answer:** Because it is a decentralized, peer-to-peer distributed database. When a new node is added, consistent hashing ensures it only takes a small slice of data from its immediate neighbors on the ring, without disrupting the entire cluster.
+
+### Q2: "If we use IP Hashing to maintain sticky sessions, what happens when that server crashes?"
+> **Answer:** The user's session is lost in memory, and the IP hash naturally routes them to the next available server (cache miss). To prevent data loss, we MUST externalize the session state to a shared Redis cluster so any server can pick up the session.
+
+### Q3: "How would you load balance a real-time multiplayer game like Valorant?"
+> **Answer:** Since games use persistent UDP/TCP connections and require raw speed with minimal packet inspection to reduce latency, I would use an L4 (Network) Load Balancer, paired with a Least Connections routing algorithm.
+
+### Q4: "We added 1000 virtual nodes, but Justin Bieber's profile is still bringing down our database. Why?"
+> **Answer:** Virtual nodes solve keyspace partitioning (distributing data evenly), not request volume per key (hotspots). To fix the celebrity problem, we must implement key salting, aggressive caching, or dedicated celebrity shards.
+
+---
+
+## 11. Rapid Revision Cheat Sheet
+
+```text
+╔══════════════════════════════════════════════════════════╗
+║           LECTURE 04 — ULTIMATE CHEAT SHEET              ║
+╠══════════════════════════════════════════════════════════╣
+║                                                          ║
+║  CONSISTENT HASHING                                      ║
+║  • Solves: Massive data migration when N servers change. ║
+║  • Mechanism: Hash servers and keys to a Ring (SHA-1).   ║
+║    Move clockwise from key to find server.               ║
+║  • Math: Only K/N keys rehashed when server count alters.║
+║  • Lookup: Binary Search on sorted array of server hashes║
+║                                                          ║
+║  VIRTUAL NODES (vNodes)                                  ║
+║  • Solves: Uneven data distribution on the ring.         ║
+║  • Mechanism: Place 100+ logical nodes per physical      ║
+║    server on the ring to interleave them.                ║
+║  • TRAP: Does NOT solve the Celebrity/Hotspot problem!   ║
+║                                                          ║
+║  HOT PARTITION (Celebrity) SOLUTIONS                     ║
+║  • Key Salting (add _1, _2 to key to spread it out)      ║
+║  • Caching (Redis/CDN)                                   ║
+║  • Dedicated shards for heavy hitters                    ║
+║                                                          ║
+║  LOAD BALANCING ALGORITHMS                               ║
+║  • Round Robin: Stateless, identical servers             ║
+║  • Weighted RR: Mismatched server specs (32GB vs 16GB)   ║
+║  • IP Hash: Sticky sessions (bad for corporate NATs)     ║
+║  • Least Connections: Long-lived connections (WebSockets)║
+║  • Least Response Time: Best for complex/variable APIs   ║
+║                                                          ║
+║  OSI LAYER LOAD BALANCING                                ║
+║  • L4 (Transport): IP/Port only. Fast, raw TCP, gaming,  ║
+║    databases. Doesn't decrypt HTTP payload.              ║
+║  • L7 (Application): HTTP/HTTPS. URL Path routing,       ║
+║    header inspection, terminates TLS. Microservices.     ║
+║                                                          ║
+║  HIGH AVAILABILITY LBs                                   ║
+║  • Active-Passive configuration with a Virtual IP (VIP)  ║
+║    ensures LB is not a Single Point of Failure (SPOF).   ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
 
 
 ---
