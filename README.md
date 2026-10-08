@@ -2314,6 +2314,8 @@ graph LR
     
     classDef db fill:#d4edda,stroke:#28a745,stroke-width:2px;
     class DB1,DB2,DB3 db;
+```
+
 ### 🧮 The Math Behind the Magic
 If you have **K** keys and **N** servers:
 
