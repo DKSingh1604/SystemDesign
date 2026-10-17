@@ -3306,14 +3306,4 @@ INSERT INTO url_mapping (short_url, long_url) VALUES ('my-brand', '...');
 
 ---
 
-## References
-- *System Design Interview Vol 1* by Alex Xu — Chapter 8: Design a URL Shortener
-- *Designing Data-Intensive Applications* by Martin Kleppmann — Chapter 5, 6 (Replication, Partitioning)
-- Twitter Snowflake: https://github.com/twitter-archive/snowflake
-- Bit.ly Engineering Blog: https://bitly.com/blog/
-- High Scalability: URL Shortener Architecture Case Studies
-
-
----
-
 ⭐ If you found this helpful, please star the repository!
