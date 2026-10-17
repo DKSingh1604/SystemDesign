@@ -2512,6 +2512,807 @@ If you only have one Load Balancer and it crashes, your entire system goes down.
 ╚══════════════════════════════════════════════════════════╝
 ```
 
+# 📘 Lecture 06: Designing a URL Shortener (Bit.ly)
+
+> **Part of:** System Design (HLD) Interview Preparation
+> **Focus:** URL Shortening, Base62 Encoding, Distributed ID Generation, Caching, and Redirection Semantics.
+> **Target:** Tier-1 MNC System Design Interviews
+
+## Table of Contents
+1. [Problem Statement & High-Level Flow](#1-problem-statement--high-level-flow)
+2. [System Requirements & Constraints](#2-system-requirements--constraints)
+3. [Back-of-the-Envelope Calculations](#3-back-of-the-envelope-calculations)
+4. [API Design](#4-api-design)
+5. [Redirection: 301 vs 302](#5-redirection-301-vs-302)
+6. [Database Design & Lookup Optimization](#6-database-design--lookup-optimization)
+7. [Short URL Generation Algorithms](#7-short-url-generation-algorithms)
+8. [Complete Architecture Flows](#8-complete-architecture-flows)
+9. [Scaling & Distribution](#9-scaling--distribution)
+10. [Production Concerns & Edge Cases](#10-production-concerns--edge-cases)
+11. [Complete System Architecture](#11-complete-system-architecture)
+12. [Algorithm Comparison Summary](#12-algorithm-comparison-summary)
+13. [Interview Follow-Up Questions](#13-interview-follow-up-questions)
+
+---
+
+## 1. Problem Statement & High-Level Flow
+
+A URL Shortener is a classic HLD interview problem that appears simple but tests breadth: hashing, database design, distributed ID generation, caching, redirection semantics, and horizontal scaling.
+
+### High-Level Flow
+
+```mermaid
+flowchart LR
+    L[Long URL] --> B[Bit.ly Clone] --> S[Short URL]
+    S2[Short URL] --> BR[Browser] --> L2[Long URL]
+```
+
+### User Flow
+- User provides a long URL → service returns a short URL
+- User visits the short URL in a browser → gets redirected to the long URL
+
+### Primary Tasks
+1. **Short URL Generation** (write path)
+2. **User Redirect** (read path)
+
+### Why URL Shorteners Exist
+- Character limits (Twitter/SMS)
+- Cleaner sharing (marketing, print media, QR codes)
+- Analytics & click tracking
+- Link management (update destination without changing the shared link)
+
+---
+
+## 2. System Requirements & Constraints
+
+### Clarifying Questions
+| Question | Answer |
+|:--|:--|
+| How many users to cater to? | 20 million URLs/day |
+| How short should the short URL be? | As short as possible |
+| What characters can be used? | `0-9`, `a-z`, `A-Z` (62 chars) |
+
+### Functional Requirements
+| Requirement | Decision |
+|:--|:--|
+| Shorten a long URL | ✅ Core |
+| Redirect short URL to long URL | ✅ Core |
+| Custom aliases (user-chosen) | Nice-to-have |
+| URL expiry (TTL) | Yes — configurable or default (e.g., 5 years) |
+| Same long URL → same short URL? | Depends on product (1:1 vs 1:many) |
+
+### Non-Functional Requirements
+| Requirement | Rationale |
+|:--|:--|
+| **High Availability** | Redirect must never fail — it IS the product |
+| **Low Latency** | Redirects must be near-instant (<100ms) |
+| **Eventual Consistency** | A newly created short URL taking 1-2s to propagate is OK |
+| **Read-heavy** | Reads vastly outnumber writes (10:1 to 100:1) |
+
+---
+
+## 3. Back-of-the-Envelope Calculations
+
+### 3.1 Throughput
+
+```
+Writes: 20M URLs/day
+      = 20 × 10⁶ / 86,400 sec
+      ≈ 231 writes/sec
+
+Reads (1:10 ratio):
+      = 231 × 10
+      ≈ 2,310 reads/sec
+
+Peak Load (3x-5x average):
+      ≈ 1,000 writes/sec, ~12,000 reads/sec
+```
+
+> **Interview Tip:** Always mention peak vs. average. Systems must be designed for peak.
+
+### 3.2 Storage (5-Year Horizon)
+
+```
+Total records = 20M × 365 × 5 = 36.5 Billion records
+
+Per-record size estimate:
+  - short URL (7 chars)    :    7 bytes
+  - long URL (avg ~200)    :  200 bytes
+  - created_at (timestamp) :    8 bytes
+  - expiry_at              :    8 bytes
+  - user_id (optional)     :    8 bytes
+  ─────────────────────────────────────
+  Total per record         : ~250 bytes (safe estimate)
+
+Total storage = 36.5 × 10⁹ × 250 bytes ≈ ~10 TB
+
+(Lecture notes used 100 bytes/record → 3.65 TB — also acceptable,
+ but 250B is safer accounting for indexes, metadata, encoding overhead.)
+```
+
+### 3.3 Bandwidth
+
+```
+Incoming (writes): 231 × 250 bytes ≈ 58 KB/s   (negligible)
+Outgoing (reads):  2,310 × 250 bytes ≈ 578 KB/s (negligible)
+```
+
+**Conclusion:** This is NOT a bandwidth-bound system. It's an **I/O and latency** problem.
+
+### 3.4 Cache Memory (80-20 Rule)
+
+```
+Daily reads = 2,310 × 86,400 ≈ 200M requests/day
+Assuming ~5M unique URLs accessed/day
+Cache top 20% = 1M entries
+Memory = 1M × 250 bytes = 250 MB
+```
+
+Fits trivially in a single Redis instance.
+
+---
+
+## 4. API Design
+
+### 4.1 Shorten URL
+
+**✅ Good Design (RECOMMENDED):**
+```http
+POST /api/v1/generate
+Content-Type: application/json
+
+{
+  "longUrl": "https://www.example.com/very/long/path?param=value",
+  "customAlias": "mylink",       // optional
+  "expiresAt": "2030-01-01"      // optional
+}
+
+Response: 201 Created
+{
+  "shortUrl": "https://bit.ly/3IY",
+  "expiresAt": "2030-01-01T00:00:00Z"
+}
+```
+
+**❌ Bad Design:** `POST /api/v1/generate?longUrl=value` (query parameter)
+- URL length limits (~2048 chars in browsers)
+- Query strings get logged in server access logs, proxies, browser history
+- Sensitive data exposed
+
+**❌ Worst Design:** `POST /api/v1/generate/{{longUrl}}` (path parameter)
+- Path segments have stricter encoding rules
+- Special chars (`?`, `&`, `=`, `#`) break the path structure
+
+### 4.2 Redirect to Long URL
+
+```http
+GET /{shortUrlKey}
+
+Response: 301 or 302 Redirect
+Location: https://www.example.com/very/long/path?param=value
+```
+
+> **Production Note:** Include rate limiting headers (Lecture 5) and API key authentication to prevent abuse. Bit.ly's free tier limits ~1000 links/month.
+
+---
+
+## 5. Redirection: 301 vs 302
+
+### 5.1 The Mechanics
+
+```
+Client                    Bit.ly Server              Destination
+  |                           |                         |
+  |--- GET /3IY ------------->|                         |
+  |                           |--- DB/Cache lookup ---->|
+  |<-- 301/302 ---------------|                         |
+  |    Location: https://example.com/long/path          |
+  |                           |                         |
+  |--- GET /long/path ------->|---- (direct) ---------->|
+  |<-- 200 OK + Page ---------|                         |
+```
+
+### 5.2 Status Code Comparison
+
+| Aspect | 301 (Permanent) | 302 (Temporary) |
+|:--|:--|:--|
+| **Browser behavior** | Caches the redirect. Next visit bypasses Bit.ly entirely. | Does NOT cache. Every visit hits Bit.ly first. |
+| **Server load** | Lower — subsequent requests never reach your servers | Higher — every click goes through your servers |
+| **Analytics** | ❌ Cannot track clicks after first visit | ✅ Can track every click, referrer, device, geo |
+| **Link updates** | ❌ Cached browsers still go to old destination | ✅ Can change destination anytime |
+| **SEO** | Passes link juice to destination permanently | Does not pass full link juice |
+| **Use case** | Personal use, cost-sensitive, low-scale | Commercial products (Bit.ly, ow.ly, t.co) |
+
+### 5.3 Decision Rule
+
+- **Use 301:** When the server is small and DB read queries must be minimized
+- **Use 302:** When the server is scalable, DB reads are optimized, and user metrics are needed (Bit.ly / ow.ly)
+
+### 5.4 Real-World Usage
+
+```
+Bit.ly  → 301 (switched from 302 for SEO; uses tracking pixels + JS for analytics)
+t.co    → 301 (Twitter's shortener)
+goo.gl  → 301 (Google's deprecated shortener)
+```
+
+### 5.5 Related Status Codes (Gap Fill)
+
+- **307 (Temporary Redirect):** Like 302 but preserves HTTP method (POST stays POST)
+- **308 (Permanent Redirect):** Like 301 but preserves HTTP method
+- **For URL shorteners:** Doesn't matter — redirects are always GET
+
+---
+
+## 6. Database Design & Lookup Optimization
+
+### 6.1 The Dual-Lookup Problem
+
+When a user submits a long URL to shorten, the system needs to check:
+> "Have I already shortened this long URL before?"
+
+Single-table design:
+```
+┌──────────┬────────────────────────────────────┐
+│ short_url│ long_url                           │
+│ (PK)     │                                    │
+├──────────┼────────────────────────────────────┤
+│ 3IY      │ https://example.com/very/long/path │
+│ x9K      │ https://another.com/page           │
+└──────────┴────────────────────────────────────┘
+```
+
+- **Redirect (short → long):** `SELECT long_url WHERE short_url = '3IY'` → **O(1)** via PK index ✅
+- **Dedup check (long → short):** `SELECT short_url WHERE long_url = '...'` → **O(n) full table scan** ❌
+
+### 6.2 Solutions to Dual-Lookup
+
+#### Option A: Two Tables (Lecture Notes' Approach)
+
+```mermaid
+block-beta
+    columns 2
+    block:DB1
+        Title1("DB 1")
+        A("short url --> long url")
+    end
+    block:DB2
+        Title2("DB 2")
+        B("long url --> short url")
+    end
+```
+
+- ✅ O(1) lookups both directions
+- ❌ Data duplication, consistency challenges in distributed systems
+
+#### Option B: Single Table + Secondary Index (Better)
+
+```sql
+CREATE TABLE url_mapping (
+    id         BIGINT PRIMARY KEY AUTO_INCREMENT,
+    short_url  VARCHAR(7) UNIQUE NOT NULL,
+    long_url   TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    expires_at TIMESTAMP,
+    user_id    BIGINT,
+    INDEX idx_long_url (long_url(255))
+);
+```
+
+- ✅ Single source of truth
+- ✅ O(log n) lookups via B-tree index
+- ❌ Secondary index has write amplification
+
+#### Option C: Skip Dedup Entirely (What Bit.ly Actually Does) — GAP FILL
+
+> Most production URL shorteners **do NOT deduplicate**. Two users shortening the same long URL get **different** short URLs.
+
+**Why?**
+1. Each user needs their own analytics dashboard
+2. Each link can have different expiry, custom alias, permissions
+3. Dedup requires an expensive lookup on every write
+4. Storage is cheap
+
+### 6.3 SQL vs NoSQL
+
+| Factor | SQL (PostgreSQL, MySQL) | NoSQL (DynamoDB, Cassandra) |
+|:--|:--|:--|
+| **Data model** | Simple key-value — fits | Simple key-value — fits |
+| **Read pattern** | Point lookups by short_url | Point lookups by short_url |
+| **Scale** | Needs sharding at billions of rows | Built-in horizontal scaling |
+| **Consistency** | Strong by default | Eventual (sufficient here) |
+| **Joins needed?** | No | No |
+| **Winner** | Works well at moderate scale | ✅ Better for massive scale |
+
+**Why DynamoDB is excellent for this use case:**
+- Key-value store (perfect fit)
+- Auto-scales read/write capacity
+- Single-digit millisecond latency
+- Built-in TTL for auto-expiring URLs
+
+---
+
+## 7. Short URL Generation Algorithms
+
+### 7.1 Approach 1: Hash + Truncate ❌
+
+**Idea:** Hash the long URL (MD5/SHA-1/SHA-256), take first 6 characters.
+
+```
+MD5("https://example.com/long/path") = "e4d909c290d0fb1ca068ffaddf22cbd0"
+Take first 6: "e4d909"
+Short URL: bit.ly/e4d909
+```
+
+**Collision Analysis (Birthday Paradox):**
+```
+MD5 produces 128-bit output. Truncating to 6 chars from 62-char alphabet
+maps 128-bit space → 62⁶ ≈ 56.8 billion space.
+
+P(collision) ≈ 1 - e^(-n² / 2m)
+At n = 36.5B URLs, m = 56.8B: P(collision) ≈ 100%
+```
+
+**Collision Resolution Flow (From Lecture Notes):**
+
+```mermaid
+flowchart TD
+    L[Long Url] --> H((hash fn)) --> S[short url]
+    S --> E{exist in DB?}
+    E -- No --> DB[Save to DB]
+    E -- Yes --> T[temp]
+    T -- append string to long url --> L
+```
+
+**Disadvantages:**
+| Problem | Explanation |
+|:--|:--|
+| **Multiple DB lookups** | Each collision = another read query |
+| **Unpredictable latency** | 1, 2, or N retries — worst case unbounded |
+| **Race conditions** | Two servers hash same URL, both check DB, both insert → duplicate |
+| **Breaks determinism** | Appending random string = same long URL produces different hashes |
+
+> **Verdict:** Mention to show awareness, but recommend Base62 immediately.
+
+### 7.2 Approach 2: Base62 Encoding of Unique ID ✅ (RECOMMENDED)
+
+**Core Idea:** Generate a unique numeric ID → encode in Base62 → produces short string.
+
+#### Base62 Character Mapping
+
+```
+Value:  0  1  2 ... 9  10 11 12 ... 35  36  37 ... 61
+Char:   0  1  2 ... 9   a  b  c ...  z   A   B ...  Z
+```
+
+#### Example: Convert ID 14320 to Base62
+
+```
+14320 ÷ 62 = 230  remainder 60  → 60 maps to 'Y'
+  230 ÷ 62 =   3  remainder 44  → 44 maps to 'I'
+    3 ÷ 62 =   0  remainder  3  →  3 maps to '3'
+
+Read remainders bottom-to-top: "3IY"
+```
+
+**Final SQL Table:**
+
+| Id | short URL | long url |
+| :--- | :--- | :--- |
+| 14320 | 3IY | www.example.com |
+
+#### Decoding (for Redirect)
+
+```
+"3IY" → 3 × 62² + 44 × 62¹ + 60 × 62⁰
+       = 11532 + 2728 + 60
+       = 14320 ✅
+```
+
+#### Length vs Capacity
+
+| Length (n) | Combinations (62ⁿ) | Sufficient For |
+|:--|:--|:--|
+| 1 | 62 | Toy |
+| 2 | 3,844 | Toy |
+| 3 | 238,328 | ~238K |
+| 4 | 14.7 Million | Small service |
+| 5 | 916 Million | Medium service |
+| 6 | 56.8 Billion | ✅ Covers 36.5B (our requirement) |
+| 7 | 3.52 Trillion | Large safety margin |
+
+**Lecture conclusion:** Max length of **6** suffices. **7** is used in interviews for 100x safety margin.
+
+#### Advantages
+```
+✅ Zero collisions — IDs are unique by definition
+✅ O(1) generation — no DB lookup to check existence
+✅ Deterministic — same ID always produces same short URL
+✅ Single table design possible
+✅ Decodable — can extract ID from short URL (useful for debugging)
+```
+
+### 7.3 Disadvantages of Base62 + ID Approach
+
+#### Problem 1: Need a Unique ID Generator
+
+| Approach | How It Works | Trade-offs |
+|:--|:--|:--|
+| **UUID** | 128-bit random ID | Too long for Base62 (22+ chars), not sortable |
+| **DB Auto-Increment** | Single DB generates sequential IDs | SPOF, bottleneck at scale |
+| **Multi-master Replication** | DB1: 1,3,5... DB2: 2,4,6... | Hard to add new DB servers dynamically |
+| **Twitter Snowflake** | 64-bit = timestamp + worker + sequence | ✅ Best choice: distributed, sortable, unique |
+| **Zookeeper / etcd** | Centralized counter | Adds operational complexity |
+| **Redis INCR** | Atomic increment in Redis | Fast, SPOF unless clustered |
+
+> **GAP FILL: Twitter Snowflake Deep Dive**
+
+```
+64-bit Snowflake ID structure:
+┌─────────┬───────────┬──────────┬──────────────┐
+│ 1 bit   │ 41 bits   │ 10 bits  │ 12 bits      │
+│(unused) │ timestamp │ machine  │ sequence     │
+│         │ (ms)      │ ID       │ number       │
+└─────────┴───────────┴──────────┴──────────────┘
+
+- 41 bits timestamp → ~69 years of unique IDs
+- 10 bits machine ID → 1,024 machines
+- 12 bits sequence → 4,096 IDs/ms per machine
+- Total: ~4 million IDs/sec globally
+```
+
+At 231 writes/sec, Snowflake is massively over-provisioned.
+
+#### Problem 2: URL Length Not Fixed
+
+```
+ID 1        → "1"      (1 char)
+ID 1000     → "g8"     (2 chars)
+ID 14320    → "3IY"    (3 chars)
+ID 56.8B    → "ZZZZZZ" (6 chars)
+```
+
+**Mitigation:** Zero-pad if needed (`000001` → `001`), but variable length is generally acceptable.
+
+#### Problem 3: Predictable/Sequential URLs (Security)
+
+```
+bit.ly/3IY  → ID 14320
+bit.ly/3IZ  → ID 14321 (attacker can enumerate!)
+```
+
+**Mitigations:**
+| Technique | How It Works |
+|:--|:--|
+| **Snowflake IDs** | Non-sequential due to timestamp + machine ID components |
+| **Random offset** | Add random offset to auto-increment ID before Base62 |
+| **Bijective shuffle** | Modular multiplicative inverse to scramble IDs |
+| **Encrypt the ID** | Format-Preserving Encryption (FPE) before Base62 |
+
+> **Production pattern:** Snowflake + FPE + Base62 = unique + non-sequential + fixed-length + distributed.
+
+#### Problem 4: Distributed ID Collision (From Lecture Notes)
+
+```
+DB Shard 1: AUTO_INCREMENT → 1, 2, 3, 4, 5...
+DB Shard 2: AUTO_INCREMENT → 1, 2, 3, 4, 5...
+
+ID 14320 exists in BOTH shards!
+Base62(14320) = "3IY" in BOTH → COLLISION!
+```
+
+> **That's why we use a Centralized ID Generator** (Snowflake / KGS / Redis).
+
+### 7.4 Approach 3: Pre-Generated Key Service (KGS) — GAP FILL
+
+```
+┌──────────────────────────────────────────────┐
+│           Key Generation Service (KGS)       │
+│                                              │
+│  Pre-generates millions of unique 6-char     │
+│  keys and stores them in a key database.     │
+│                                              │
+│  ┌─────────────┐    ┌─────────────┐          │
+│  │ Unused Keys │  → │ Used Keys   │          │
+│  │ Pool        │    │ Pool        │          │
+│  └─────────────┘    └─────────────┘          │
+└──────────────────────────────────────────────┘
+```
+
+**How it works:**
+1. KGS pre-generates random 6-char Base62 strings offline
+2. Stores them in two tables: `unused_keys` and `used_keys`
+3. App servers fetch batches of keys, keep in-memory buffer
+4. Keys marked "used" when allocated
+
+**Advantages:**
+- ✅ Zero collision risk (keys pre-validated unique)
+- ✅ Extremely fast — just a lookup
+- ✅ No sequential pattern
+- ✅ Fixed-length
+
+**Disadvantages:**
+- ❌ KGS is SPOF (mitigate with standby replicas)
+- ❌ Wasted keys if server crashes with buffered keys (acceptable loss)
+- ❌ Additional infrastructure
+
+**Storage for KGS:**
+```
+62⁶ = 56.8B keys × 7 bytes ≈ 400 GB
+At 20M/day consumption → 7.8 years of keys
+```
+
+---
+
+## 8. Complete Architecture Flows
+
+### 8.1 Write Path (URL Shortening)
+
+```mermaid
+flowchart TD
+    C[Client] -- "POST longURL" --> LB[Load Balancer]
+    LB -- "longUrl" --> S[Server]
+    S -- "longUrl" --> DB[(DB)]
+    S --> Cache[(Cache)]
+```
+
+**Detailed Sequence:**
+```
+Client             LB          Server       ID Gen         DB          Cache
+  |                 |             |             |             |            |
+  |-- POST longUrl->|             |             |             |            |
+  |                 |-- forward ->|             |             |            |
+  |                 |             |-- get ID -->|             |            |
+  |                 |             |<-- 14320 ---|             |            |
+  |                 |             |-- Base62(14320) = "3IY"   |            |
+  |                 |             |-- INSERT (3IY, longUrl) ->|            |
+  |                 |             |-- SET cache(3IY → longUrl)------------>|
+  |<-- 201 Created -|<------------|             |             |            |
+  |  shortUrl:/3IY  |             |             |             |            |
+```
+
+### 8.2 Read Path (Redirection)
+
+```mermaid
+flowchart TD
+    C[Client] -- "GET shortUrl" --> LB[Load Balancer]
+    LB -- "shortUrl" --> S[Server]
+    S -- "longUrl" --> DB[(DB)]
+    S <-->|"shortUrl lookup"| Cache[(Cache)]
+    S -- "302, longUrl" --> C
+    C -- "redirect" --> LURL[Long URL]
+```
+
+**Detailed Sequence:**
+```
+Client             LB          Server          Cache          DB
+  |                 |             |               |             |
+  |-- GET /3IY ---->|             |               |             |
+  |                 |-- forward ->|               |             |
+  |                 |             |-- GET(3IY) -->|             |
+  |                 |             |               |             |
+  |         [Cache HIT path]                      |             |
+  |                 |             |<-- longUrl ---|             |
+  |                 |             |               |             |
+  |         [Cache MISS path]                     |             |
+  |                 |             |-- SELECT WHERE short='3IY'->|
+  |                 |             |<-- longUrl -----------------|
+  |                 |             |-- SET(3IY, longUrl) ------->|
+  |                 |             |                             |
+  |<-- 302 Found ---|<------------|               |             |
+  | Location:longUrl|             |               |             |
+  |-- GET longUrl ->| (direct to destination server)            |
+```
+
+### 8.3 Caching Strategy
+
+**Policy:** Cache-Aside (Lazy Loading)
+- Redirect: Check cache → if miss, query DB → populate cache → return
+- Creation: Write DB → write-through to cache
+
+**Eviction:** LRU (Least Recently Used)
+- Hot URLs (viral links) stay in cache
+- Old URLs get evicted
+
+**Technology:** Redis
+```
+Key:   "3IY"
+Value: "https://example.com/very/long/path?param=value"
+TTL:   24 hours (re-populated on access)
+```
+
+**Capacity:** ~250MB-1GB for hot set — single Redis node sufficient. Use cluster (2-3 nodes) for HA.
+
+---
+
+## 9. Scaling & Distribution
+
+### 9.1 Database Sharding
+
+At 36.5B records, single DB won't suffice. **Shard by short URL hash** using consistent hashing (Lecture 4):
+
+```
+Shard = hash(short_url) % N_shards
+```
+
+- Even distribution via consistent hashing
+- Each shard holds subset of mappings
+- Redirect lookups go directly to the correct shard
+
+**Why NOT shard by long URL?**
+- Redirects use short URL as the key
+- Sharding by long URL would require broadcasting to all shards
+
+### 9.2 Centralized ID Generator
+
+```
+                    ┌─────────────────────┐
+                    │  Snowflake / KGS    │
+                    │  (Unique ID Source) │
+                    └────────┬────────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+        ┌──────────┐  ┌──────────┐  ┌──────────┐
+        │ Server 1 │  │ Server 2 │  │ Server 3 │
+        └─────┬────┘  └─────┬────┘  └─────┬────┘
+              │             │             │
+              ▼             ▼             ▼
+        ┌──────────┐  ┌──────────┐  ┌──────────┐
+        │DB Shard 1│  │DB Shard 2│  │DB Shard 3│
+        └──────────┘  └──────────┘  └──────────┘
+```
+
+**Guarantees:**
+- Globally unique IDs across all shards
+- No collisions regardless of shard count
+- Horizontally scalable
+
+---
+
+## 10. Production Concerns & Edge Cases
+
+### 10.1 URL Expiry & Cleanup
+
+```sql
+-- Records have expires_at field
+-- Background cron:
+DELETE FROM url_mapping WHERE expires_at < NOW();
+
+-- Or use DynamoDB TTL (automatic, zero cost)
+```
+
+After deletion, keys can be **recycled** back to KGS unused pool (or abandoned — plenty of keys).
+
+### 10.2 Analytics (If Using 302)
+
+Each redirect passes through your server:
+```json
+{
+  "short_url": "3IY",
+  "timestamp": "2025-01-15T10:30:00Z",
+  "referrer": "https://twitter.com/status/123",
+  "user_agent": "Mozilla/5.0...",
+  "ip": "203.0.113.42",
+  "country": "US",
+  "device": "mobile"
+}
+```
+
+**Pipeline:** Event → Kafka → Spark/Flink → Grafana dashboard
+
+### 10.3 Preventing Abuse
+
+| Threat | Mitigation |
+|:--|:--|
+| **Spam / Phishing URLs** | Check against Google Safe Browsing API before shortening |
+| **Enumeration attack** | Non-sequential IDs (Snowflake + FPE), rate limiting on redirects |
+| **DDoS on redirects** | CDN caching of 301 redirects, rate limiting (Lecture 5) |
+| **Link bombing** | Rate limit URL creation per user/IP (e.g., 100/hour) |
+
+### 10.4 Custom Aliases
+
+```sql
+-- Check availability
+SELECT 1 FROM url_mapping WHERE short_url = 'my-brand';
+
+-- Insert if available
+INSERT INTO url_mapping (short_url, long_url) VALUES ('my-brand', '...');
+```
+
+**Collision avoidance with Base62 keys:**
+- Reserve a character (e.g., custom aliases must contain `-`, which Base62 doesn't produce)
+- Use separate namespaces in DB
+
+---
+
+## 11. Complete System Architecture
+
+```
+                                    ┌──────────────────┐
+                                    │   Analytics      │
+                                    │   (Kafka → Flink)│
+                                    └────────▲─────────┘
+                                             │ click events
+┌────────┐      ┌──────┐      ┌──────────────┼──────────────┐
+│ Client │──────│ CDN  │───── │      Load Balancer          │
+└────────┘      └──────┘      └──────┬───────┬───────┬──────┘
+                                     │       │       │
+                               ┌─────▼──┐ ┌──▼────┐ ┌▼──────┐
+                               │Server 1│ │Server2│ │Server3│
+                               └───┬──┬─┘ └──┬──┬─┘ └┬──┬───┘
+                                   │  │      │  │    │  │
+                              ┌────▼──▼──────▼──▼────▼──▼────┐
+                              │         Redis Cache          │
+                              │    (LRU, ~250MB-1GB)         │
+                              └────────────┬─────────────────┘
+                                           │ cache miss
+                    ┌──────────────────────┐│
+                    │  Snowflake ID Gen /  ││
+                    │  Key Gen Service     ││
+                    └──────────┬───────────┘│
+                               │            │
+                 ┌─────────────┼────────────┼─────────────┐
+                 │             │            │             │
+           ┌─────▼────┐ ┌─────▼────┐ ┌────▼─────┐ ┌────▼─────┐
+           │DB Shard 1│ │DB Shard 2│ │DB Shard 3│ │DB Shard 4│
+           │DynamoDB/ │ │          │ │          │ │          │
+           │PostgreSQL│ │          │ │          │ │          │
+           └──────────┘ └──────────┘ └──────────┘ └──────────┘
+```
+
+---
+
+## 12. Algorithm Comparison Summary
+
+| Criteria | Hash + Truncate | Base62 + Unique ID | Pre-generated KGS |
+|:--|:--|:--|:--|
+| **Collision risk** | High (needs resolution) | Zero | Zero |
+| **Speed** | Slow (DB checks per collision) | Fast (O(1) encode) | Fastest (pre-computed) |
+| **Fixed length** | Yes (always 6) | No (1 to 7 chars) | Yes (always 6 or 7) |
+| **Predictable** | No | Yes (if sequential ID) | No |
+| **Complexity** | Low | Medium (needs ID gen) | High (needs KGS infra) |
+| **Production use** | ❌ Avoid | ✅ Most common | ✅ Used at scale |
+
+---
+
+## 13. Interview Follow-Up Questions
+
+| Question | Key Points in Answer |
+|:--|:--|
+| **How would you handle a viral link getting millions of clicks/sec?** | Cache-aside in Redis + CDN caching of 301 redirects + DB read replicas |
+| **What if the ID generator goes down?** | Snowflake is decentralized (each worker generates independently). KGS: standby replica. Redis: sentinel/cluster mode. |
+| **How do you prevent the same long URL from being shortened twice?** | Most systems don't — each submission gets unique short URL. If required: secondary index on long_url or Bloom filter for fast existence checks. |
+| **How would you implement link expiry?** | `expires_at` column + DynamoDB TTL (or cron for SQL). Cache TTL matches. Expired keys return 410 Gone. |
+| **301 or 302?** | 302 if analytics matter (Bit.ly's business model). 301 if minimizing server load. |
+| **How do you handle 1000:1 read-to-write ratio?** | Multiple read replicas, aggressive Redis caching, CDN layer for 301 redirects |
+| **How would you implement rate limiting?** | Token bucket per API key (see Lecture 5), Redis + Lua for atomicity |
+| **What if two users want the same custom alias?** | First-come-first-served with unique constraint on short_url column; return 409 Conflict |
+| **How do you handle URL analytics at scale?** | Fire-and-forget to Kafka, async batch processing via Flink/Spark, aggregated to time-series DB |
+| **How would you support URL preview (unfurl)?** | Separate async service fetches long URL, caches title/description/image; served alongside redirect |
+
+---
+
+## Key Takeaways
+
+1. **Choose Base62 + Snowflake ID** as the primary generation strategy — it's collision-free, fast, and distributed
+2. **302 redirects** enable analytics (Bit.ly's business model); **301 redirects** reduce server load
+3. **DynamoDB** or sharded SQL both work — key-value access pattern makes this a NoSQL-friendly problem
+4. **Redis cache** with LRU eviction handles the 10:1+ read-to-write ratio
+5. **Centralized ID generator** is essential to avoid collisions across database shards
+6. **CDN + 301** can offload reads entirely from your origin servers for massive scale
+7. **Dedup is usually NOT a requirement** — each user gets their own short URL for independent analytics
+8. **Security:** Non-sequential IDs (Snowflake + FPE) prevent URL enumeration attacks
+
+---
+
+## References
+- *System Design Interview Vol 1* by Alex Xu — Chapter 8: Design a URL Shortener
+- *Designing Data-Intensive Applications* by Martin Kleppmann — Chapter 5, 6 (Replication, Partitioning)
+- Twitter Snowflake: https://github.com/twitter-archive/snowflake
+- Bit.ly Engineering Blog: https://bitly.com/blog/
+- High Scalability: URL Shortener Architecture Case Studies
+
 
 ---
 
