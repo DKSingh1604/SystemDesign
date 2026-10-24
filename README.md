@@ -3306,4 +3306,525 @@ INSERT INTO url_mapping (short_url, long_url) VALUES ('my-brand', '...');
 
 ---
 
+
+# 📘 Lecture 07: Designing a Notification System
+
+> **Part of:** System Design (HLD) Interview Preparation  
+> **Focus:** Multi-Channel Delivery (Push/SMS/Email), Priority Queues, Async Fan-out, Rate Limiting, Retry & DLQ Architecture.  
+> **Target:** Tier-1 MNC System Design Interviews
+
+## Table of Contents
+1. [Clarifying Questions & Scope](#1-clarifying-questions--scope)
+2. [Core Entities & High-Level Flow](#2-core-entities--high-level-flow)
+3. [Back-of-the-Envelope Calculations](#3-back-of-the-envelope-calculations)
+4. [API Design](#4-api-design)
+5. [Delivery Channels Deep Dive](#5-delivery-channels-deep-dive)
+6. [Basic Architecture & Its Flaws](#6-basic-architecture--its-flaws)
+7. [Improved Asynchronous Architecture](#7-improved-asynchronous-architecture)
+8. [Failure Handling & Retry Mechanisms](#8-failure-handling--retry-mechanisms)
+9. [System Improvements & Components](#9-system-improvements--components)
+10. [Advanced Production Topics](#10-advanced-production-topics)
+11. [Complete System Architecture](#11-complete-system-architecture)
+12. [Interview Follow-Up Questions](#12-interview-follow-up-questions)
+13. [Key Takeaways](#13-key-takeaways)
+
+---
+
+## 1. Clarifying Questions & Scope
+
+Notification systems (like those at WhatsApp, Instagram, or Uber) are classic examples of **asynchronous, event-driven, fan-out architectures**.
+
+### 1.1 Types of Notifications
+- **PUSH:** Mobile (iOS / Android) and Web (Desktop / Mobile browsers)
+- **SMS:** Text messages via telecom carriers (Transactional OTPs, critical alerts)
+- **Email:** Rich HTML templates (Receipts, newsletters, onboarding)
+- *(Bonus for interviews: In-App messaging, Voice calls / OTP, Webhooks)*
+
+### 1.2 Realtime vs. Soft Realtime
+
+| Property | Hard Realtime System | Soft Realtime System (Notification System) |
+|:---|:---|:---|
+| **Latency Guarantee** | Deterministic deadlines; visible immediately (synchronous) | Best-effort; delivered *as soon as possible* |
+| **Failure Condition** | Missing a deadline = total catastrophic failure (e.g., Pacemaker, ABS) | Slight delay is acceptable; system operates normally |
+| **Execution Model** | Synchronous | **Asynchronous (Queue-driven)** |
+| **Why for Notifications?** | Not feasible over the public internet | We do not control the last-mile delivery (3rd-party vendor APIs, telecom carriers, offline user devices) |
+
+### 1.3 Supported Platforms & Vendors
+- **iOS:** Apple Push Notification service (APNs)
+- **Android:** Firebase Cloud Messaging (FCM)
+- **Web Push:** VAPID / Web Push Protocol
+- **SMS:** Twilio, Sinch, AWS SNS, Infobip
+- **Email:** SendGrid, Mailchimp, AWS SES
+
+---
+
+## 2. Core Entities & High-Level Flow
+
+```mermaid
+flowchart LR
+    Upstream[Upstream Microservices<br/>Auth / Order / Social] --> API[Notification Service API]
+    API -->|Async Enqueue| Worker[Executor / Worker Fleet]
+    Worker -->|Vendor API Call| Vendor[3rd-Party Gateway<br/>APNs / FCM / Twilio / SendGrid]
+    Vendor -->|Last-Mile Delivery| Device[End User Device]
+```
+
+### Core Entities Defined
+
+| Entity | Description | Responsibility |
+|:---|:---|:---|
+| **Upstream Microservices** | Order Service, Auth Service, Marketing Engine | Emits notification events when business actions happen |
+| **Notification Service** | Public / Internal API layer | Validates input, authenticates caller, applies user preferences/templates, and enqueues jobs |
+| **Executor / Worker Fleet** | Distributed consumer processes | Pulls jobs from queues, formats vendor payloads, calls 3rd-party APIs, and handles retries |
+| **3rd-Party Providers** | APNs, FCM, Twilio, SendGrid | Transmits data across telecom and OS proprietary push networks |
+| **End User Device** | Mobile (iOS/Android), Browser, Email Inbox | Receives and renders notifications to the user |
+
+---
+
+## 3. Back-of-the-Envelope Calculations
+
+### 3.1 Assumptions & Throughput
+
+```
+Assumptions:
+  - Daily Active Users (DAU)    : 1 Million
+  - Average Notifications/User  : 10 / day
+  - Total Notifications/Day     : 1M × 10 = 10 Million notifications / day
+
+Average Throughput (QPS):
+  = 10,000,000 / 86,400 seconds
+  ≈ 116 requests/sec
+
+Peak Throughput (5x multiplier for flash events / news bursts):
+  = 116 × 5
+  ≈ 580 requests/sec
+```
+
+### 3.2 Storage (Notification Logs & Audit Trail)
+
+```
+Per-Record Size:
+  - Notification ID, User ID, Channel, Template ID, Status, Timestamps
+  ≈ 200 Bytes
+
+Daily Storage:
+  = 10 Million × 200 Bytes
+  ≈ 2 GB / day
+
+1-Month Retention (Active Cache / DB):
+  = 2 GB × 30 days
+  ≈ 60 GB (~100 GB including indexes & write buffers)
+
+5-Year Long-Term Retention:
+  = 2 GB × 365 × 5
+  ≈ 3.65 TB (Tiered into Cold Storage: AWS S3 / Glacier)
+```
+
+### 3.3 Network Bandwidth
+
+```
+Inbound Payload Size (from Microservice → Notification API): ≈ 1 KB
+
+Daily Inbound Data:
+  = 10 Million × 1 KB
+  ≈ 10 GB / day
+
+Average Bandwidth:
+  = 10 GB / 86,400 seconds
+  ≈ 116 KB/sec (~0.93 Mbps)
+
+Peak Bandwidth (5x multiplier):
+  = 116 KB/sec × 5
+  ≈ 580 KB/sec (~4.64 Mbps)
+```
+
+> [!NOTE]
+> **Key Conclusion:** The notification system is **I/O, concurrency, and latency-bound**, **NOT network bandwidth-bound**.
+
+---
+
+## 4. API Design
+
+### 4.1 Fetch User Notification Preferences & Device Tokens
+Fetches user device registration tokens, enabled channels, and Do-Not-Disturb (DND) window.
+
+```http
+GET /api/v1/users/{userId}/notifications/preferences
+```
+
+**Sample Response (`200 OK`):**
+```json
+{
+  "userId": "101",
+  "name": "Dev",
+  "deviceTokens": {
+    "ios": ["apns_token_abc123"],
+    "android": ["fcm_token_xyz789"]
+  },
+  "notificationPermissions": {
+    "PUSH": true,
+    "Email": false,
+    "SMS": true
+  },
+  "dndWindow": {
+    "start": "22:00",
+    "end": "07:00",
+    "timezone": "Asia/Kolkata"
+  }
+}
+```
+
+### 4.2 Send Notification
+Asynchronously dispatches a notification payload.
+
+```http
+POST /api/v1/notifications
+Headers:
+  Authorization: Bearer <token>
+  X-Idempotency-Key: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+```
+
+**Request Body:**
+```json
+{
+  "from": "order-service",
+  "to": "202",
+  "type": "push",
+  "priority": "high",
+  "templateId": "order_shipped_v2",
+  "templateData": {
+    "orderId": "ORD-1234",
+    "eta": "6:00 PM"
+  }
+}
+```
+
+**Response (`202 Accepted`):**
+```json
+{
+  "status": "ACCEPTED",
+  "notificationId": "noti_987654321",
+  "message": "Notification queued for asynchronous delivery"
+}
+```
+
+> [!IMPORTANT]
+> **Why `202 Accepted` instead of `200 OK`?**  
+> Delivery is asynchronous. The API server only guarantees that the notification has been validated and queued—not that the third-party carrier has delivered it to the handset.
+
+### 4.3 Fetch Notification History (In-App Inbox)
+Fetches a user's chronological notification feed.
+
+```http
+GET /api/v1/notifications?userId=101&limit=50&cursor=eyJpZCI6IjEyMzQ1In0=
+```
+
+> [!TIP]
+> **Production Best Practice:** Always use **Cursor-based pagination** instead of Offset/Page-based pagination (`OFFSET 100`). Real-time incoming notifications shift offsets, causing duplicate or skipped records for the user.
+
+---
+
+## 5. Delivery Channels Deep Dive
+
+| Channel | Primary Vendors | Payload Limit | Transport Protocol | Critical Production Challenges |
+|:---|:---|:---|:---|:---|
+| **iOS Push** | Apple Push Notification service (APNs) | 4 KB | HTTP/2 persistent connection | Requires `.p8` certificate tokens; connection pooling; handling `410 Gone` to purge dead tokens. |
+| **Android Push** | Firebase Cloud Messaging (FCM) | 4 KB | HTTP/v1 REST / XMPP | Supports topic subscriptions for millions in 1 call; OS Doze mode/battery optimization wakeups. |
+| **SMS** | Twilio, Sinch, AWS SNS | 160 chars / segment | REST API + Webhooks | Strict telecom regulatory compliance (DLT in India, 10DLC / TCPA in USA); high unit cost; fallback routing. |
+| **Email** | SendGrid, AWS SES, Mailgun | 10–25 MB | SMTP / REST API | Deliverability: Requires DNS configuration (**SPF, DKIM, DMARC**) to avoid landing in Spam. |
+
+---
+
+## 6. Basic Architecture & Its Flaws
+
+### Naive Monolithic Architecture
+
+```mermaid
+flowchart LR
+    S1[Order Service] --> NS[Notification Service]
+    S2[Auth Service] --> NS
+    NS --> APNs[APNs Gateway]
+    NS --> Twilio[Twilio SMS API]
+    NS --> SendGrid[SendGrid Email API]
+```
+
+### Why this Naive Design Fails in Production
+
+1. **Single Point of Failure (SPOF):**  
+   If the monolithic notification service crashes or its host fails, all system alerts company-wide stop dead.
+2. **Cascading Failure & Thread Exhaustion:**  
+   Upstream services make synchronous blocking calls. If Twilio's API experiences high latency, API threads pool out, degrading the caller (e.g., checkout freezes waiting for SMS confirmation).
+3. **Inability to Scale Channels Independently:**  
+   Push is lightweight and high-volume (millions/sec); SMS is slow and expensive (dozens/sec). A shared process cannot be scaled or throttled per channel.
+4. **No Retry & Recovery Guarantees:**  
+   Transient network timeouts or HTTP 503 errors cause notifications to be permanently lost with no retry queue.
+5. **Head-of-Line Blocking:**  
+   A large marketing campaign (10M emails) will fill server resources, delaying time-critical transactional OTPs by minutes.
+
+---
+
+## 7. Improved Asynchronous Architecture
+
+To resolve the naive flaws, we introduce **Message Queues (Kafka / RabbitMQ)** to fully decouple ingestion from channel dispatching.
+
+```mermaid
+flowchart LR
+    Services[Upstream Microservices] --> LB[Load Balancer]
+    LB --> API[Notification API Server]
+
+    API --- Redis[(Redis Cache<br/>Prefs, DND, Tokens)]
+    API --- PG[(PostgreSQL<br/>Templates, Rules)]
+
+    API --> Q_Push[Kafka: PUSH Topic]
+    API --> Q_SMS[Kafka: SMS Topic]
+    API --> Q_Email[Kafka: EMAIL Topic]
+
+    Q_Push --> W1[Push Workers] --> APNs[APNs / FCM]
+    Q_SMS --> W2[SMS Workers] --> Twilio[Twilio SMS]
+    Q_Email --> W3[Email Workers] --> SendGrid[SendGrid]
+
+    W1 -. "Metrics & Logs" .-> Analytics[Analytics Engine]
+    W2 -. "Metrics & Logs" .-> Analytics
+    W3 -. "Metrics & Logs" .-> Analytics
+    Analytics --> Cassandra[(Cassandra / S3 Logs)]
+```
+
+### Key Architectural Components
+
+- **Notification API Server:** Stateless REST layer. Authenticates caller, validates schema, queries Redis for DND and user preferences, renders templates, and enqueues to Kafka in $<10\text{ ms}$.
+- **Redis Cache:** Ultra-fast memory cache for user channel preferences, registered device tokens, rate-limit buckets, and idempotency locks.
+- **PostgreSQL (RDBMS):** Source of truth for notification templates, localization dictionaries, and configuration schemas.
+- **Message Queues (Kafka):** Provides buffer absorption for sudden traffic spikes. Separate queues per channel isolate outages (e.g., an APNs outage never delays SMS).
+- **Dedicated Workers:** Stateless consumers scaled horizontally based on specific channel throughput and vendor rate limits.
+- **Cassandra / S3 Archive:** Append-heavy, partitioned datastore designed for high-throughput write logging and customer support audits.
+
+---
+
+## 8. Failure Handling & Retry Mechanisms
+
+How do workers identify delivery failures and safely recover without causing message storms?
+
+```mermaid
+flowchart TD
+    Consume[Worker Consumes Message] --> CallAPI[Invoke 3rd-Party Vendor API]
+    CallAPI --> Check{HTTP Status?}
+    Check -->|200 / 202 OK| Success[ACK Message<br/>Log 'DELIVERED' status]
+    Check -->|400 Bad Request| Drop[Drop Message<br/>Log 'CLIENT_ERROR']
+    Check -->|410 Gone / Unregistered| Invalidate[Invalidate Device Token in DB<br/>Drop Message]
+    Check -->|429 / 5xx / Socket Timeout| RetryCheck{Retry Count < Max?}
+    RetryCheck -->|Yes| Backoff[Exponential Backoff + Jitter<br/>Re-queue Message / NACK] --> Consume
+    RetryCheck -->|No| DLQ[Move to Dead Letter Queue DLQ<br/>Emit Critical PagerDuty Alert]
+```
+
+### Scenario A: Immediate API Failure (Synchronous Error)
+- **What Happens:** Worker calls APNs/Twilio and gets `503 Service Unavailable`, `429 Rate Limited`, or a socket timeout.
+- **Detection:** Handled via HTTP response code or timeout exception.
+- **Action (ACK / NACK):** Worker issues a **NACK (Negative Acknowledgement)**.
+- **Retry Strategy:**
+  - **Exponential Backoff with Full Jitter:**
+    $$\text{Wait Time} = \min\left(\text{MaxBackoff},\, \text{Base} \times 2^{\text{attempt}}\right) + \text{random\_jitter}$$
+  - Full jitter prevents **thundering herds** against already struggling vendor servers.
+- **Dead Letter Queue (DLQ):** After 3–5 unsuccessful attempts, message is routed to a DLQ for offline triage.
+- **Terminal Errors:** `400 Bad Request` (bad syntax) or `410 Gone` (user uninstalled app) are **never retried**.
+
+### Scenario B: Downstream Delivery Failure (Asynchronous Error)
+- **What Happens:** Twilio accepts the request with `200 OK`, but the user's handset is powered off or disconnected from telecom towers.
+- **Detection:** Worker has already committed its queue ACK. Hours later, the vendor issues an **HTTP POST Webhook (Delivery Receipt / DLR)**.
+- **Action:** Webhook ingestion server updates the notification state in Cassandra/PostgreSQL to `FAILED`.
+- **Channel Fallback:** Critical events can trigger automatic fallback (e.g., if Push fails to deliver within 5 minutes, fallback to SMS).
+
+---
+
+## 9. System Improvements & Components
+
+### 9.1 Notification Templates & Localization (i18n)
+- Templates stored centrally in PostgreSQL and cached in Redis.
+- Decouples message copy from engineering code releases.
+- Supports variable interpolation: `"Hello {{name}}, your order {{orderId}} has shipped!"`.
+- Enforces regulatory compliance (e.g., DLT registered templates in India).
+
+### 9.2 User Settings & Do-Not-Disturb (DND)
+- Timezone-aware quiet windows (e.g., `22:00` to `07:00`).
+- **Transactional Bypass:** Security OTPs and emergency fraud alerts bypass DND.
+- **Marketing Deferral:** Promotional pushes during DND are delayed and re-queued for the user's morning window (`07:01`).
+
+### 9.3 Rate Limiting & User Fatigue Protection
+- Protects users from notification spam and prevents vendor API quota breaches.
+- Implemented using **Token Bucket / Sliding Window in Redis**.
+- Configured per user (e.g., max 3 promotional notifications per day).
+
+### 9.4 Security & Data Privacy
+- **Idempotency Keys:** `X-Idempotency-Key` prevents double-charging and duplicate messages.
+- **PII Masking:** Email addresses and phone numbers masked in all log drains (`d***@gmail.com`).
+- **Transit & Rest Encryption:** TLS 1.3 in transit; AES-256 at rest.
+
+### 9.5 Notification Analytics & Audit Logging
+- Delivery events logged asynchronously to Cassandra or ClickHouse.
+- Streamed via Kafka into Elasticsearch / OpenSearch for customer support search tooling.
+
+---
+
+## 10. Advanced Production Topics
+
+### 10.1 Priority Queues & Head-of-Line Blocking
+OTPs must never be delayed behind millions of bulk marketing messages.
+
+```mermaid
+flowchart LR
+    API[Notification API] --> Q_High[Kafka: push_critical<br/>Priority: HIGH]
+    API --> Q_Low[Kafka: push_marketing<br/>Priority: LOW]
+    
+    Q_High --> W_Dedicated[Dedicated Critical Workers]
+    Q_Low --> W_Batch[Batch Marketing Workers]
+    
+    W_Dedicated --> PushGateway[Push Service Gateway]
+    W_Batch --> PushGateway
+```
+
+- **Solution:** Segregate topics by priority (`sms_critical` vs `sms_promo`).
+- **Resource Allocation:** Allocate dedicated worker pools for critical queues with autoscaling tied to latency SLAs.
+
+### 10.2 Mass Fan-Out (e.g., Netflix New Season Release)
+Broadcasting a notification to 100M users must not overwhelm the system with 100M individual API requests.
+
+1. **Batch Chunking:**  
+   The marketing service emits a single campaign event to a **Fan-Out Service**. The service fetches targeted user segments, batches them into chunks of 1,000 user IDs, and enqueues worker tasks.
+2. **Native Vendor Topic Subscriptions:**  
+   For push notifications, use **FCM Topics** or **APNs Broadcast Channels**. One single API call from your worker instructs FCM to deliver to millions of subscribed devices natively.
+
+### 10.3 Deduplication Guarantee (Idempotency)
+Because distributed queues operate on **At-Least-Once** semantics, duplicate network transmissions can occur.
+
+```mermaid
+sequenceDiagram
+    participant S as Upstream Service
+    participant API as Notification API
+    participant R as Redis (Idempotency Store)
+    participant K as Kafka
+
+    S->>API: POST /notifications (X-Idempotency-Key: UUID)
+    API->>R: SET key "PROCESSING" NX EX 86400
+    alt Key already exists (Duplicate)
+        R-->>API: Nil (Conflict)
+        API-->>S: 200 OK / 202 Accepted (Ignored safely)
+    else Key successfully set (New)
+        R-->>API: OK
+        API->>K: Produce to Channel Topic
+        API-->>S: 202 Accepted
+    end
+```
+
+---
+
+## 11. Complete System Architecture
+
+```text
+┌────────────┐  ┌────────────┐  ┌────────────┐
+│ Order Svc  │  │ Auth (OTP) │  │ Marketing  │
+└──────┬─────┘  └──────┬─────┘  └──────┬─────┘
+       └───────────────┼───────────────┘
+                       ▼
+          ┌────────────────────────────┐
+          │     API Gateway + WAF      │
+          │   Rate Limiting (Redis)    │
+          └────────────┬───────────────┘
+                       │
+                       ▼
+          ┌────────────────────────────┐
+          │  Notification API Service  │
+          │  - Verify Idempotency      │
+          │  - Apply Templates & DND   │
+          └──┬──────────────────────┬──┘
+             │                      │
+             ▼                      ▼
+    ┌────────────────┐    ┌──────────────────┐
+    │  Redis Cache   │    │  PostgreSQL      │
+    │  - User Prefs  │    │  - User Prefs    │
+    │  - Idempotency │    │  - Templates     │
+    │  - DND Windows │    │  - Credentials   │
+    └────────────────┘    └──────────────────┘
+             │
+             ▼
+    ┌──────────────────────────────────────────────┐
+    │        Kafka (Per Channel + Priority)        │
+    │  ┌──────────┬──────────┬──────────┬───────┐  │
+    │  │ push_p1  │ push_p2  │  sms_p1  │ email │  │
+    │  └──────────┴──────────┴──────────┴───────┘  │
+    └──┬────────────┬────────────┬───────────┬─────┘
+       │            │            │           │
+       ▼            ▼            ▼           ▼
+   ┌───────┐    ┌───────┐    ┌───────┐   ┌───────┐
+   │ APNs  │    │  FCM  │    │Twilio │   │SendGrd│
+   │Worker │    │Worker │    │Worker │   │Worker │
+   └───┬───┘    └───┬───┘    └───┬───┘   └───┬───┘
+       │            │            │           │
+       ├─── On transient failure → NACK & Exponential Backoff
+       ├─── On poison failure    → Dead Letter Queue (DLQ)
+       │
+       ▼ (Delivery Status & Webhook DLRs)
+   ┌───────────────────────────────────────────────┐
+   │          Analytics & Audit Log Engine         │
+   │           (Cassandra + AWS S3 Cold)           │
+   └───────────────────────────────────────────────┘
+```
+
+---
+
+## 12. Interview Follow-Up Questions
+
+| Question | Key Points in Answer |
+|:---|:---|
+| **How do you handle a major 3rd-party outage (e.g., Twilio down)?** | Implement a **Circuit Breaker pattern**. The SMS queue buffers messages safely. If critical, trigger dynamic fallback to secondary vendor (e.g., switch to Sinch/Infobip). |
+| **How do you prevent duplicate notifications from being delivered?** | Use client-provided `X-Idempotency-Key` stored with `SETNX` and a 24h TTL in Redis. Workers drop duplicates before invoking external vendor APIs. |
+| **How do you handle invalid device tokens?** | APNs/FCM return an HTTP `410 Gone` or `NotRegistered` response. Worker immediately drops the message and dispatches a DB event to deactivate that device token. |
+| **How do you guarantee OTPs arrive under 5 seconds?** | Isolate transactional traffic into dedicated high-priority queues (`sms_critical`) with reserved worker capacity, bypassing DND and marketing rate limits. |
+| **What happens if the primary database goes down?** | Read replicas serve user preferences. Redis cache absorbs frequent lookups. If DB writes fail, the API queues messages with default templates; processing continues without dropping events. |
+| **How do you prevent notification fatigue / spam?** | Implement **Global & Category Rate Limits** (Token bucket in Redis) and frequency capping (e.g., max 3 marketing messages per week per user). |
+| **How do you handle devices that are offline for days?** | APNs and FCM store notifications for a configurable **TTL (Time to Live)** and deliver upon device reconnect. Expired messages are dropped automatically by vendor servers. |
+
+---
+
+## 13. Key Takeaways
+
+1. **Always Build Asynchronous:** Synchronous notification chains collapse under scale. Separate message queues decouple APIs and isolate third-party vendor latencies.
+2. **Channel-Specific Isolation:** Dedicated queues and worker pools prevent failures in one channel (e.g., APNs outage) from impacting other channels (e.g., SMS OTPs).
+3. **Resilience with Backoff & DLQ:** Use exponential backoff with full jitter for transient 5xx/429 errors, vendor webhooks for downstream failures, and Dead Letter Queues (DLQs) for poisoned payloads.
+4. **Enforce Idempotency:** Distributed queues operate on At-Least-Once delivery. Redis-backed `X-Idempotency-Key` validation prevents duplicate sends and duplicate vendor billing.
+5. **Polyglot Persistence:** Use PostgreSQL for transactional templates/settings, Redis for high-speed cache/locks, and Cassandra + S3 for petabyte-scale append-only audit trails.
+
+---
+
+```text
+╔══════════════════════════════════════════════════════════╗
+║              LECTURE 07 CHEAT SHEET                      ║
+╠══════════════════════════════════════════════════════════╣
+║                                                          ║
+║  SYSTEM CORE & PARADIGM                                  ║
+║  • Delivery Type: Soft Real-Time (Best Effort)           ║
+║  • Architecture: Async, Event-Driven, Fan-Out            ║
+║  • API Response: 202 Accepted (Never synchronous 200)    ║
+║                                                          ║
+║  CHANNEL PROVIDERS & PROTOCOLS                           ║
+║  • iOS: APNs (HTTP/2 persistent, .p8 token, 4KB payload) ║
+║  • Android: FCM (HTTP v1, topic subscriptions, 4KB limit)║
+║  • SMS: Twilio / Sinch (DLT / TCPA compliance, expensive)║
+║  • Email: SendGrid / SES (SPF, DKIM, DMARC for deliver)  ║
+║                                                          ║
+║  RELIABILITY & FAULT TOLERANCE                           ║
+║  • Transient Errors: Exponential backoff with jitter     ║
+║  • Poison Messages: Dead Letter Queue (DLQ) after 3-5x   ║
+║  • Async Dropouts: Vendor Webhook / DLR receipts         ║
+║  • Token Invalidation: 410 Gone removes token from DB    ║
+║                                                          ║
+║  PERFORMANCE & SCALE STRATEGIES                          ║
+║  • Priority Topics: Isolate critical (OTP) from promo    ║
+║  • Mass Fan-Out: Chunking (batches of 1000) or FCM Topic ║
+║  • Deduplication: Redis SETNX with X-Idempotency-Key     ║
+║  • Rate Limiting: Token Bucket per user in Redis         ║
+║  • Storage Split: Postgres (prefs), Cassandra (logs)     ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+---
+
 ⭐ If you found this helpful, please star the repository!
