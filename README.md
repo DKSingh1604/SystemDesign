@@ -3590,7 +3590,7 @@ flowchart LR
 
 ### Key Architectural Components
 
-- **Notification API Server:** Stateless REST layer. Authenticates caller, validates schema, queries Redis for DND and user preferences, renders templates, and enqueues to Kafka in $<10\text{ ms}$.
+- **Notification API Server:** Stateless REST layer. Authenticates caller, validates schema, queries Redis for DND and user preferences, renders templates, and enqueues to Kafka in `< 10 ms`.
 - **Redis Cache:** Ultra-fast memory cache for user channel preferences, registered device tokens, rate-limit buckets, and idempotency locks.
 - **PostgreSQL (RDBMS):** Source of truth for notification templates, localization dictionaries, and configuration schemas.
 - **Message Queues (Kafka):** Provides buffer absorption for sudden traffic spikes. Separate queues per channel isolate outages (e.g., an APNs outage never delays SMS).
@@ -3621,7 +3621,10 @@ flowchart TD
 - **Action (ACK / NACK):** Worker issues a **NACK (Negative Acknowledgement)**.
 - **Retry Strategy:**
   - **Exponential Backoff with Full Jitter:**
-    $$\text{Wait Time} = \min\left(\text{MaxBackoff},\, \text{Base} \times 2^{\text{attempt}}\right) + \text{random\_jitter}$$
+   
+    ```text
+    Wait Time = min(MaxBackoff, Base * 2^attempt) + random_jitter
+    ```
   - Full jitter prevents **thundering herds** against already struggling vendor servers.
 - **Dead Letter Queue (DLQ):** After 3–5 unsuccessful attempts, message is routed to a DLQ for offline triage.
 - **Terminal Errors:** `400 Bad Request` (bad syntax) or `410 Gone` (user uninstalled app) are **never retried**.
